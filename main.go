@@ -18,7 +18,12 @@ func main() {
 	r := gin.Default()
 	r.GET("/env", getENV)
 	r.GET("/secret", getSecret)
+	r.GET("/health", healthCheck)
 	r.Run(":80")
+}
+
+func healthCheck(c *gin.Context) {
+	c.Status(http.StatusOK)
 }
 
 func getSecret(c *gin.Context) {
