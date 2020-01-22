@@ -1,0 +1,33 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      golang: 1.12
+      docker: 18
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo $CODEBUILD_SOURCE_VERSION
+      - export ECR_URL="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - export IMAGE_SHA_TAG=`echo $CODEBUILD_SOURCE_VERSION | cut -c 1-7 | tr -s '/' '-'`
+      - echo Building binary
+      - go get
+      - go build -o ./bin/main .
+      - echo Building the Docker image $SERVICE_NAME:$IMAGE_SHA_TAG
+      - docker build -t $SERVICE_NAME:$IMAGE_SHA_TAG .
+      - docker tag $SERVICE_NAME:$IMAGE_SHA_TAG $ECR_URL/$SERVICE_NAME:$IMAGE_SHA_TAG
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker image...
+      - docker push $ECR_URL/$SERVICE_NAME:$IMAGE_SHA_TAG
+      - IMAGE_REPO_NAME=$SERVICE_NAME
+      - TAG=latest
+      - MANIFEST=$(aws --region $AWS_REGION ecr batch-get-image --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_SHA_TAG --query images[].imageManifest --output text)
+      - echo Pushing the latest tag
+      - aws --region $AWS_REGION ecr put-image --repository-name $IMAGE_REPO_NAME --image-tag $TAG --image-manifest "$MANIFEST"

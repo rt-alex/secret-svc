@@ -1,0 +1,48 @@
+Parameters:
+
+  EnvironmentName:
+    Description: VPC Environment
+    Type: String
+
+  ClusterName:
+    Description: Cluster Name
+    Type: String
+
+  ServiceName:
+    Description: Service Name
+    Type: String
+
+  ANodeWeight:
+    Description: Weight for A node
+    Type: Number
+    MinValue: 0
+    MaxValue: 100
+
+  BNodeWeight:
+    Description: Weight for A node
+    Type: Number
+    MinValue: 0
+    MaxValue: 100
+
+Resources:
+
+  Route:
+    Type: AWS::AppMesh::Route
+    Properties:
+      MeshName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+      VirtualRouterName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}:VirtualRouterName"
+      RouteName: !Sub "${EnvironmentName}-${ServiceName}-route"
+      Spec:
+        HttpRoute:
+          Match:
+            Prefix: "/"
+          Action:
+            WeightedTargets:
+            - VirtualNode: !Sub "${ServiceName}-A-node"
+              Weight: !Ref ANodeWeight
+            - VirtualNode: !Sub "${ServiceName}-B-node"
+              Weight: !Ref BNodeWeight

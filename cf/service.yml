@@ -1,0 +1,477 @@
+Parameters:
+
+  EnvironmentName:
+    Description: VPC Environment
+    Type: String
+
+  ClusterName:
+    Description: Cluster Name
+    Type: String
+
+  ServiceName:
+    Description: Service Name
+    Type: String
+
+  NodeAImage:
+    Description: Image to use for Service container
+    Type: String
+    Default: 928401392503.dkr.ecr.us-east-1.amazonaws.com/secret-svc:latest
+
+  NodeBImage:
+    Description: Image to use for Service container
+    Type: String
+    Default: 928401392503.dkr.ecr.us-east-1.amazonaws.com/secret-svc:latest
+
+  EnvoyImage:
+    Description: Image to use for Envoy sidecar
+    Type: String
+    Default: 111345817488.dkr.ecr.us-west-2.amazonaws.com/aws-appmesh-envoy:v1.9.1.0-prod
+
+  # XrayImage:
+  #   Description: Image to use for Xray Daemon
+  #   Type: String
+  #   Default: amazon/aws-xray-daemon:latest
+
+Resources:
+
+  ServiceRegistry:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Ref ServiceName
+      DnsConfig:
+        NamespaceId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-${ClusterName}:NamespaceID"
+        DnsRecords:
+          - Type: A
+            TTL: 300
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  ServiceANode:
+    Type: AWS::AppMesh::VirtualNode
+    Properties:
+      MeshName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+      VirtualNodeName: !Sub "${ServiceName}-A-node"
+      Spec:
+        ServiceDiscovery:
+          AWSCloudMap:
+            ServiceName: !Ref ServiceName
+            NamespaceName: !Sub "${EnvironmentName}-${ClusterName}.local"
+            Attributes:
+            - Key: "ECS_TASK_DEFINITION_FAMILY"
+              Value: !Sub "${EnvironmentName}-${ServiceName}-A"
+        Listeners:
+        - PortMapping:
+            Port: 80
+            Protocol: http
+          HealthCheck:
+            Protocol: http
+            Path: "/health"
+            HealthyThreshold: 2
+            UnhealthyThreshold: 2
+            TimeoutMillis: 2000
+            IntervalMillis: 5000
+
+  ServiceBNode:
+    Type: AWS::AppMesh::VirtualNode
+    Properties:
+      MeshName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+      VirtualNodeName: !Sub "${ServiceName}-B-node"
+      Spec:
+        ServiceDiscovery:
+          AWSCloudMap:
+            ServiceName: !Ref ServiceName
+            NamespaceName: !Sub "${EnvironmentName}-${ClusterName}.local"
+            Attributes:
+            - Key: "ECS_TASK_DEFINITION_FAMILY"
+              Value: !Sub "${EnvironmentName}-${ServiceName}-B"
+        Listeners:
+        - PortMapping:
+            Port: 80
+            Protocol: http
+          HealthCheck:
+            Protocol: http
+            Path: "/health"
+            HealthyThreshold: 2
+            UnhealthyThreshold: 2
+            TimeoutMillis: 2000
+            IntervalMillis: 5000
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: "Security group for the service"
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}:VPC"
+
+  SecurityGroupNodeIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      SourceSecurityGroupId: !Ref SecurityGroup
+      IpProtocol: "-1"
+
+  SecurityGroupGatewayIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      SourceSecurityGroupId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-${ClusterName}:GatewaySecurityGroupName"
+      IpProtocol: "-1"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+      RetentionInDays: 30
+
+  VirtualRouter:
+    Type: AWS::AppMesh::VirtualRouter
+    Properties:
+      MeshName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+      VirtualRouterName: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+      Spec:
+        Listeners:
+          - PortMapping:
+              Port: 80
+              Protocol: http
+
+  VirtualService:
+    Type: AWS::AppMesh::VirtualService
+    Properties:
+      MeshName:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+      VirtualServiceName: !Sub "${ServiceName}.${EnvironmentName}-${ClusterName}.local"
+      Spec:
+        Provider:
+          VirtualRouter:
+            VirtualRouterName: !GetAtt VirtualRouter.VirtualRouterName
+
+  TaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      # - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  TaskExecutionIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+      # - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  NodeATaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+      - 'FARGATE'
+      Family: !Sub "${EnvironmentName}-${ServiceName}-A"
+      NetworkMode: 'awsvpc'
+      Cpu: "256"
+      Memory: "512"
+      TaskRoleArn: !GetAtt TaskExecutionIamRole.Arn
+      ExecutionRoleArn: !GetAtt TaskExecutionIamRole.Arn
+      ProxyConfiguration:
+        Type: 'APPMESH'
+        ContainerName: 'envoy'
+        ProxyConfigurationProperties:
+        - Name: 'IgnoredUID'
+          Value: '1337'
+        - Name: 'ProxyIngressPort'
+          Value: '15000'
+        - Name: 'ProxyEgressPort'
+          Value: '15001'
+        - Name: 'AppPorts'
+          Value: '80'
+        - Name: 'EgressIgnoredIPs'
+          Value: '169.254.170.2,169.254.169.254'
+      ContainerDefinitions:
+      - Name: 'app'
+        Image: !Ref NodeAImage
+        Essential: true
+        DependsOn:
+        - ContainerName: "envoy"
+          Condition: "HEALTHY"
+        LogConfiguration:
+          LogDriver: 'awslogs'
+          Options:
+            awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'A'
+        PortMappings:
+        - ContainerPort: 80
+          Protocol: 'tcp'
+        Environment:
+        - Name: "VERSION"
+          Value: "1"
+        - Name: "NODE"
+          Value: "A"
+        - Name: "NAME"
+          Value: !Ref ServiceName
+        - Name: "PORT"
+          Value: "80"
+        - Name: "DOMAIN"
+          Value: !Sub "${EnvironmentName}-${ClusterName}.local"
+        - Name: "STAGE"
+          Value: !Ref EnvironmentName
+        Secrets:
+        - Name: "NR_LICENSE_KEY"
+          ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/newrelic/licenseKey"
+      - Name: envoy
+        Image: !Ref EnvoyImage
+        Essential: true
+        User: '1337'
+        Ulimits:
+        - Name: "nofile"
+          HardLimit: 15000
+          SoftLimit: 15000
+        PortMappings:
+        - ContainerPort: 9901
+          Protocol: 'tcp'
+        - ContainerPort: 15000
+          Protocol: 'tcp'
+        - ContainerPort: 15001
+          Protocol: 'tcp'
+        HealthCheck:
+          Command:
+          - 'CMD-SHELL'
+          - 'curl -s http://localhost:9901/server_info | grep state | grep -q LIVE'
+          Interval: 5
+          Timeout: 2
+          Retries: 3
+        LogConfiguration:
+          LogDriver: 'awslogs'
+          Options:
+            awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'A'
+        Environment:
+        - Name: 'APPMESH_VIRTUAL_NODE_NAME'
+          Value: !Sub
+          - mesh/${MeshName}/virtualNode/${ServiceANode.VirtualNodeName}
+          - MeshName:
+              Fn::ImportValue: !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+        # - Name: "ENABLE_ENVOY_XRAY_TRACING"
+        #   Value: "1"
+        - Name: 'ENVOY_LOG_LEVEL'
+          Value: 'debug'
+      # - Name: xray-daemon
+      #   Image: !Ref XrayImage
+      #   Cpu: 32
+      #   MemoryReservation: 256
+      #   PortMappings:
+      #   - ContainerPort: 2000
+      #     Protocol: udp
+      #   LogConfiguration:
+      #     LogDriver: 'awslogs'
+      #     Options:
+      #       awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+      #       awslogs-region: !Ref AWS::Region
+      #       awslogs-stream-prefix: "xrayA"
+
+  NodeBTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+      - 'FARGATE'
+      Family: !Sub "${EnvironmentName}-${ServiceName}-B"
+      NetworkMode: 'awsvpc'
+      Cpu: "256"
+      Memory: "512"
+      TaskRoleArn: !GetAtt TaskExecutionIamRole.Arn
+      ExecutionRoleArn: !GetAtt TaskExecutionIamRole.Arn
+      ProxyConfiguration:
+        Type: 'APPMESH'
+        ContainerName: 'envoy'
+        ProxyConfigurationProperties:
+        - Name: 'IgnoredUID'
+          Value: '1337'
+        - Name: 'ProxyIngressPort'
+          Value: '15000'
+        - Name: 'ProxyEgressPort'
+          Value: '15001'
+        - Name: 'AppPorts'
+          Value: '80'
+        - Name: 'EgressIgnoredIPs'
+          Value: '169.254.170.2,169.254.169.254'
+        # - Name: "ENABLE_ENVOY_XRAY_TRACING"
+        #   Value: "1"
+      ContainerDefinitions:
+      - Name: 'app'
+        Image: !Ref NodeBImage
+        Essential: true
+        DependsOn:
+        - ContainerName: "envoy"
+          Condition: "HEALTHY"
+        LogConfiguration:
+          LogDriver: 'awslogs'
+          Options:
+            awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'B'
+        PortMappings:
+        - ContainerPort: 80
+          Protocol: 'tcp'
+        Environment:
+        - Name: "VERSION"
+          Value: "1"
+        - Name: "NODE"
+          Value: "B"
+        - Name: "NAME"
+          Value: !Ref ServiceName
+        - Name: "PORT"
+          Value: "80"
+        - Name: "DOMAIN"
+          Value: !Sub "${EnvironmentName}-${ClusterName}.local"
+        - Name: "STAGE"
+          Value: !Ref EnvironmentName
+        Secrets:
+        - Name: "NR_LICENSE_KEY"
+          ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/newrelic/licenseKey"
+      - Name: envoy
+        Image: !Ref EnvoyImage
+        Essential: true
+        User: '1337'
+        Ulimits:
+        - Name: "nofile"
+          HardLimit: 15000
+          SoftLimit: 15000
+        PortMappings:
+        - ContainerPort: 9901
+          Protocol: 'tcp'
+        - ContainerPort: 15000
+          Protocol: 'tcp'
+        - ContainerPort: 15001
+          Protocol: 'tcp'
+        HealthCheck:
+          Command:
+          - 'CMD-SHELL'
+          - 'curl -s http://localhost:9901/server_info | grep state | grep -q LIVE'
+          Interval: 5
+          Timeout: 2
+          Retries: 3
+        LogConfiguration:
+          LogDriver: 'awslogs'
+          Options:
+            awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'B'
+        Environment:
+        - Name: 'APPMESH_VIRTUAL_NODE_NAME'
+          Value: !Sub
+          - mesh/${MeshName}/virtualNode/${ServiceBNode.VirtualNodeName}
+          - MeshName:
+              Fn::ImportValue: !Sub "${EnvironmentName}-${ClusterName}:MeshName"
+        # - Name: "ENABLE_ENVOY_XRAY_TRACING"
+        #   Value: "1"
+        - Name: 'ENVOY_LOG_LEVEL'
+          Value: 'debug'
+      # - Name: xray-daemon
+      #   Image: !Ref XrayImage
+      #   Cpu: 32
+      #   MemoryReservation: 256
+      #   PortMappings:
+      #   - ContainerPort: 2000
+      #     Protocol: udp
+      #   LogConfiguration:
+      #     LogDriver: 'awslogs'
+      #     Options:
+      #       awslogs-group: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}"
+      #       awslogs-region: !Ref AWS::Region
+      #       awslogs-stream-prefix: "xrayB"
+
+  NodeBService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:ECSCluster"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      LaunchType: 'FARGATE'
+      ServiceRegistries:
+      - RegistryArn: !GetAtt ServiceRegistry.Arn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+          - !Ref SecurityGroup
+          Subnets: 
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet1"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet2"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet3"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet4"
+      TaskDefinition: !Ref NodeBTaskDefinition
+
+  NodeAService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-${ClusterName}:ECSCluster"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      LaunchType: 'FARGATE'
+      ServiceRegistries:
+      - RegistryArn: !GetAtt ServiceRegistry.Arn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+          - !Ref SecurityGroup
+          Subnets: 
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet1"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet2"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet3"
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}:ECSSubnet4"
+      TaskDefinition: !Ref NodeATaskDefinition
+
+Outputs:
+  VirtualRouterName:
+    Description: Virtual Router Name
+    Value: !GetAtt VirtualRouter.VirtualRouterName
+    Export:
+      Name: !Sub "${EnvironmentName}-${ClusterName}-${ServiceName}:VirtualRouterName"
